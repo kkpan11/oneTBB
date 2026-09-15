@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2005-2022 Intel Corporation
+    Copyright (c) 2005-2024 Intel Corporation
+    Copyright (c) 2026 UXL Foundation Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -33,6 +34,7 @@
 #include <tbb/parallel_for.h>
 #include <algorithm>
 #include <cmath>
+#include <random>
 
 //! \file test_concurrent_vector.cpp
 //! \brief Test for [containers.concurrent_vector] specification
@@ -66,15 +68,15 @@ void TestRangeBasedFor(){
 
 struct default_container_traits {
     template <typename container_type, typename iterator_type>
-    static container_type& construct_container(typename std::aligned_storage<sizeof(container_type)>::type& storage, iterator_type begin, iterator_type end){
-        container_type* ptr = reinterpret_cast<container_type*>(&storage);
+    static container_type& construct_container(utils::UninitializedStorage<container_type>& storage, iterator_type begin, iterator_type end){
+        container_type* ptr = &storage;
         new (ptr) container_type(begin, end);
         return *ptr;
     }
 
     template <typename container_type, typename iterator_type, typename allocator_type>
-    static container_type& construct_container(typename std::aligned_storage<sizeof(container_type)>::type& storage, iterator_type begin, iterator_type end, allocator_type const& a){
-        container_type* ptr = reinterpret_cast<container_type*>(&storage);
+    static container_type& construct_container(utils::UninitializedStorage<container_type>& storage, iterator_type begin, iterator_type end, allocator_type const& a){
+        container_type* ptr = &storage;
         new (ptr) container_type(begin, end, a);
         return *ptr;
     }
@@ -692,14 +694,36 @@ TEST_CASE("swap with not always equal allocators"){
 // or fail with the assertion in debug mode.
 //! \brief \ref regression
 TEST_CASE("Testing vector in a highly concurrent environment") {
-    for (std::size_t i = 0; i < 10000; ++i) {
+    std::uniform_int_distribution<> uniform_dist(1, 32); // grow by from 1 to 32 randomly
+    std::mt19937_64 gen(/*seed*/1); // Constructing with seed to have reproducible results
+    constexpr int num_repeats = 10000, num_inserts = 256;
+    std::vector<int> grow_by_vals(num_inserts);
+
+    for (int i = 0; i < num_repeats; ++i) {
+        int expected_size = 0, expected_sum = 0;
+        std::generate(grow_by_vals.begin(), grow_by_vals.end(),
+                      [&gen, &uniform_dist, &expected_size, &expected_sum]() {
+                          const int random_value = uniform_dist(gen);
+                          expected_size += random_value;
+                          expected_sum += random_value * random_value;
+                          return random_value;
+                      });
+
         tbb::concurrent_vector<int> test_vec;
+        tbb::parallel_for(0, num_inserts, [&] (int j) {
+            tbb::concurrent_vector<int>::iterator start_it = test_vec.grow_by(grow_by_vals[j]);
+            tbb::concurrent_vector<int>::iterator end_it = start_it + grow_by_vals[j];
+            do {
+                *start_it = grow_by_vals[j];
+            } while (++start_it != end_it);
+        });
 
-        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, 10000), [&] (const tbb::blocked_range<std::size_t>&) {
-            test_vec.grow_by(1);
-        }, tbb::static_partitioner{});
-
-        REQUIRE(test_vec.size() == utils::get_platform_max_threads());
+        REQUIRE(test_vec.size() == expected_size);
+        int actual_sum = 0;
+        for (int j = 0; j < expected_size; ++j) {
+            actual_sum += test_vec[j];
+        }
+        REQUIRE(expected_sum == actual_sum);
     }
 }
 

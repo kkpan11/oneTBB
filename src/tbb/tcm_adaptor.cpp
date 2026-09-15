@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2023-2024 Intel Corporation
+    Copyright (c) 2023-2025 Intel Corporation
+    Copyright (c) 2026 UXL Foundation Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -23,8 +24,6 @@
 #include "misc.h"
 #include "tcm.h"
 #include "tcm_adaptor.h"
-
-#include <iostream>
 
 namespace tbb {
 namespace detail {
@@ -170,7 +169,7 @@ public:
         __TBB_ASSERT_EX(res == TCM_RESULT_SUCCESS, nullptr);
     }
 
-    void init(d1::constraints& constraints) {
+    void init(tcm_client_id_t client_id, d1::constraints& constraints) {
         __TBB_ASSERT(tcm_request_permit, nullptr);
         __TBB_ASSERT(tcm_deactivate_permit, nullptr);
 
@@ -180,16 +179,25 @@ public:
         {
             my_permit_constraints.max_concurrency = constraints.max_concurrency;
             my_permit_constraints.min_concurrency = 0;
-            my_permit_constraints.core_type_id = constraints.core_type;
-            my_permit_constraints.numa_id = constraints.numa_id;
-            my_permit_constraints.threads_per_core = constraints.max_threads_per_core;
+            my_permit_constraints.mask = my_arena.get_affinity_mask();
 
-            my_permit_request.cpu_constraints = &my_permit_constraints;
-            my_permit_request.constraints_size = 1;
+            // The affinity mask is resolved by TBBBind from arena constraints.
+            // If TBBBind is not loaded, the mask will be null and TCM will only
+            // enforce concurrency limits without CPU placement constraints.
+            if (my_permit_constraints.mask) {
+                my_permit_request.cpu_constraints = &my_permit_constraints;
+                my_permit_request.constraints_size = 1;
+            }
         }
 
         my_permit_request.min_sw_threads = 0;
         my_permit_request.max_sw_threads = 0;
+        my_permit_request.flags.request_as_inactive = 1;
+
+        tcm_result_t res = tcm_request_permit(client_id, my_permit_request, this, &my_permit_handle, nullptr);
+        __TBB_ASSERT_EX(res == TCM_RESULT_SUCCESS, nullptr);
+
+        my_permit_request.flags.request_as_inactive = 0;
     }
 
     void register_thread() override {
@@ -236,7 +244,12 @@ tcm_result_t renegotiation_callback(tcm_permit_handle_t, void* client_ptr, tcm_c
 }
 
 void tcm_adaptor::initialize() {
-    tcm_functions_loaded = dynamic_link(TCMLIB_NAME, tcm_link_table, /* tcm_link_table size = */ 11);
+    constexpr std::size_t tcm_link_table_size = sizeof(tcm_link_table) / sizeof(tcm_link_table[0]);
+    // Allow system loader to search for TCM in the environment rather than load it from certain
+    // location.
+    constexpr int flags = DYNAMIC_LINK_DEFAULT & ~DYNAMIC_LINK_BUILD_ABSOLUTE_PATH;
+    tcm_functions_loaded = dynamic_link(TCMLIB_NAME, tcm_link_table, tcm_link_table_size,
+                                        /*handle*/nullptr, flags);
 }
 
 bool tcm_adaptor::is_initialized() {
@@ -279,7 +292,7 @@ pm_client* tcm_adaptor::create_client(arena& a) {
 }
 
 void tcm_adaptor::register_client(pm_client* c, d1::constraints& constraints) {
-    static_cast<tcm_client*>(c)->init(constraints);
+    static_cast<tcm_client*>(c)->init(my_impl->client_id, constraints);
 }
 
 void tcm_adaptor::unregister_and_destroy_client(pm_client& c) {

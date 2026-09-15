@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2020-2023 Intel Corporation
+    Copyright (c) 2020-2025 Intel Corporation
+    Copyright (c) 2025 UXL Foundation Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -101,6 +102,7 @@ public:
     thread_data(unsigned short index, bool is_worker)
         : my_arena_index{ index }
         , my_is_worker{ is_worker }
+        , my_is_registered { false }
         , my_task_dispatcher{ nullptr }
         , my_arena{ nullptr }
         , my_last_client{ nullptr }
@@ -138,12 +140,15 @@ public:
     void enter_task_dispatcher(task_dispatcher& task_disp, std::uintptr_t stealing_threshold);
     void leave_task_dispatcher();
     void propagate_task_group_state(std::atomic<uint32_t> d1::task_group_context::* mptr_state, d1::task_group_context& src, uint32_t new_state);
+    d1::task* get_innermost_running_task();
 
     //! Index of the arena slot the scheduler occupies now, or occupied last time
     unsigned short my_arena_index;
 
     //! Indicates if the thread is created by RML
     const bool my_is_worker;
+
+    bool my_is_registered;
 
     //! The current task dipsatcher
     task_dispatcher* my_task_dispatcher;
@@ -251,9 +256,12 @@ inline void thread_data::propagate_task_group_state(std::atomic<std::uint32_t> d
     my_context_list->epoch.store(the_context_state_propagation_epoch.load(std::memory_order_relaxed), std::memory_order_release);
 }
 
+inline d1::task* thread_data::get_innermost_running_task() {
+    return my_task_dispatcher->m_innermost_running_task;
+}
+
 } // namespace r1
 } // namespace detail
 } // namespace tbb
 
 #endif // __TBB_thread_data_H
-

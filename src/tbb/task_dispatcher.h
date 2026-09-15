@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2020-2023 Intel Corporation
+    Copyright (c) 2020-2025 Intel Corporation
+    Copyright (c) 2025 UXL Foundation Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -111,16 +112,23 @@ inline suspend_point_type::suspend_point_type(arena* a, size_t stack_size, task_
 //------------------------------------------------------------------------
 // Task Dispatcher
 //------------------------------------------------------------------------
+
 inline task_dispatcher::task_dispatcher(arena* a) {
     m_execute_data_ext.context = a->my_default_ctx;
     m_execute_data_ext.task_disp = this;
 }
 
+#if !__TBB_USE_ADDRESS_SANITIZER
 inline bool task_dispatcher::can_steal() {
     __TBB_ASSERT(m_stealing_threshold != 0, nullptr);
     stack_anchor_type anchor{};
     return reinterpret_cast<std::uintptr_t>(&anchor) > m_stealing_threshold;
 }
+#else
+// ASan allocates fake stack which not necessarily monotonically grows downwards, therefore
+// we can't rely on stack overflow protection mechanism when Address Sanitizer is enabled.
+inline bool task_dispatcher::can_steal() { return true; }
+#endif
 
 inline d1::task* task_dispatcher::get_inbox_or_critical_task(
     execution_data_ext& ed, mail_inbox& inbox, isolation_type isolation, bool critical_allowed)
@@ -169,8 +177,8 @@ inline d1::task* task_dispatcher::steal_or_get_critical(
 
 template <bool ITTPossible, typename Waiter>
 d1::task* task_dispatcher::receive_or_steal_task(
-    thread_data& tls, execution_data_ext& ed, Waiter& waiter, isolation_type isolation,
-    bool fifo_allowed, bool critical_allowed)
+    thread_data& tls, execution_data_ext& ed, Waiter& waiter, context_guard_helper<ITTPossible>& ctxguard,
+    isolation_type isolation, bool fifo_allowed, bool critical_allowed)
 {
     __TBB_ASSERT(governor::is_thread_data_set(&tls), nullptr);
     // Task to return
@@ -199,6 +207,9 @@ d1::task* task_dispatcher::receive_or_steal_task(
         if (!waiter.continue_execution(slot, t)) {
             __TBB_ASSERT(t == nullptr, nullptr);
             break;
+        }
+        if( ITTPossible ) {
+            ctxguard.maybe_end_itt_task(waiter.pause_count());
         }
         // Start searching
         if (t != nullptr) {
@@ -249,15 +260,23 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter ) {
         task_dispatcher& task_disp;
         execution_data_ext old_execute_data_ext;
         properties old_properties;
+        d1::task* old_innermost_running_task;
+        bool is_initially_registered;
 
         ~dispatch_loop_guard() {
             task_disp.m_execute_data_ext = old_execute_data_ext;
             task_disp.m_properties = old_properties;
+            task_disp.m_innermost_running_task = old_innermost_running_task;
+
+            if (!is_initially_registered) {
+                task_disp.m_thread_data->my_arena->my_tc_client.get_pm_client()->unregister_thread();
+                task_disp.m_thread_data->my_is_registered = false;
+            }
 
             __TBB_ASSERT(task_disp.m_thread_data && governor::is_thread_data_set(task_disp.m_thread_data), nullptr);
             __TBB_ASSERT(task_disp.m_thread_data->my_task_dispatcher == &task_disp, nullptr);
         }
-    } dl_guard{ *this, m_execute_data_ext, m_properties };
+    } dl_guard{ *this, m_execute_data_ext, m_properties, m_innermost_running_task, m_thread_data->my_is_registered };
 
     // The context guard to track fp setting and itt tasks.
     context_guard_helper</*report_tasks=*/ITTPossible> context_guard;
@@ -281,6 +300,11 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter ) {
 
     m_properties.outermost = false;
     m_properties.fifo_tasks_allowed = false;
+
+    if (!dl_guard.is_initially_registered) {
+        m_thread_data->my_arena->my_tc_client.get_pm_client()->register_thread();
+        m_thread_data->my_is_registered = true;
+    }
 
     t = get_critical_task(t, ed, isolation, critical_allowed);
     if (t && m_thread_data->my_inbox.is_idle_state(true)) {
@@ -315,6 +339,9 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter ) {
                     void* itt_caller = ed.context->my_itt_caller;
                     suppress_unused_warning(itt_caller);
 
+                    d1::task* prev_innermost_running_task = m_innermost_running_task;
+                    m_innermost_running_task = t;
+
                     ITT_CALLEE_ENTER(ITTPossible, t, itt_caller);
 
                     if (ed.context->is_group_execution_cancelled()) {
@@ -330,6 +357,7 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter ) {
                     ed.affinity_slot = d1::no_slot;
                     // Reset task owner id for bypassed task
                     ed.original_slot = m_thread_data->my_arena_index;
+                    m_innermost_running_task = prev_innermost_running_task;
                     t = get_critical_task(t, ed, isolation, critical_allowed);
                 }
                 __TBB_ASSERT(m_thread_data && governor::is_thread_data_set(m_thread_data), nullptr);
@@ -348,9 +376,9 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter ) {
                     continue;
                 }
                 // Retrieve the task from global sources
-                t = receive_or_steal_task<ITTPossible>(
-                    *m_thread_data, ed, waiter, isolation, dl_guard.old_properties.fifo_tasks_allowed,
-                    critical_allowed
+                t = receive_or_steal_task(
+                    *m_thread_data, ed, waiter, context_guard, isolation,
+                    dl_guard.old_properties.fifo_tasks_allowed, critical_allowed
                 );
             } while (t != nullptr); // main dispatch loop
             break; // Exit exception loop;
@@ -358,9 +386,15 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter ) {
             if (global_control::active_value(global_control::terminate_on_exception) == 1) {
                 do_throw_noexcept([] { throw; });
             }
-            if (ed.context->cancel_group_execution()) {
-                /* We are the first to signal cancellation, so store the exception that caused it. */
-                ed.context->my_exception.store(tbb_exception_ptr::allocate(), std::memory_order_release);
+
+            ed.context->cancel_group_execution();
+            tbb_exception_ptr* exception = ed.context->my_exception.load(std::memory_order_acquire);
+            if (!exception) {
+                auto e = tbb_exception_ptr::allocate();
+                if (!ed.context->my_exception.compare_exchange_strong(exception, e,
+                                                                      std::memory_order_acq_rel)) {
+                    e->destroy();
+                }
             }
         }
     } // Infinite exception loop
@@ -392,7 +426,7 @@ inline void task_dispatcher::recall_point() {
 }
 #endif /* __TBB_RESUMABLE_TASKS */
 
-#if __TBB_PREVIEW_CRITICAL_TASKS
+#if __TBB_CRITICAL_TASKS
 inline d1::task* task_dispatcher::get_critical_task(d1::task* t, execution_data_ext& ed, isolation_type isolation, bool critical_allowed) {
     __TBB_ASSERT( critical_allowed || !m_properties.critical_task_allowed, nullptr );
 
@@ -465,4 +499,3 @@ d1::task* task_dispatcher::local_wait_for_all(d1::task* t, Waiter& waiter) {
 } // namespace tbb
 
 #endif // _TBB_task_dispatcher_H
-

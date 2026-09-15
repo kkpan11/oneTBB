@@ -1,4 +1,5 @@
-# Copyright (c) 2020-2024 Intel Corporation
+# Copyright (c) 2020-2025 Intel Corporation
+# Copyright (c) 2026 UXL Foundation Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 3.5)
+# If the running version of CMake is older than 3.12, the extra ... dots will be seen as version component separators,
+# resulting in the ...<max> part being ignored and preserving the pre-3.12 behavior of basing policies on <min>.
+cmake_minimum_required(VERSION 3.5.0...3.31.3)
 
 # Enable CMake policies
+
+if (POLICY CMP0063)
+    # The NEW behavior for this policy is to honor the visibility properties for all target types.
+    cmake_policy(SET CMP0063 NEW)
+    set(CMAKE_POLICY_DEFAULT_CMP0063 NEW)
+endif()
 
 if (POLICY CMP0068)
     # RPATH settings do not affect install_name on macOS since CMake 3.9
@@ -27,6 +36,11 @@ if (POLICY CMP0091)
     cmake_policy(SET CMP0091 NEW)
 elseif (DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
     message(FATAL_ERROR "CMAKE_MSVC_RUNTIME_LIBRARY was defined while policy CMP0091 is not available. Use CMake 3.15 or newer.")
+endif()
+
+if (POLICY CMP0148)
+    # CMake 3.27: The FindPythonInterp and FindPythonLibs modules are removed
+    cmake_policy(SET CMP0148 OLD)
 endif()
 
 if (TBB_WINDOWS_DRIVER AND (NOT ("${CMAKE_MSVC_RUNTIME_LIBRARY}" STREQUAL MultiThreaded OR "${CMAKE_MSVC_RUNTIME_LIBRARY}" STREQUAL MultiThreadedDebug)))
@@ -49,7 +63,7 @@ string(REGEX REPLACE ".*#define TBB_VERSION_MINOR ([0-9]+).*" "\\1" _tbb_ver_min
 string(REGEX REPLACE ".*#define TBB_VERSION_PATCH ([0-9]+).*" "\\1" _tbb_ver_patch "${_tbb_version_info}")
 string(REGEX REPLACE ".*#define TBB_INTERFACE_VERSION ([0-9]+).*" "\\1" TBB_INTERFACE_VERSION "${_tbb_version_info}")
 string(REGEX REPLACE ".*#define __TBB_BINARY_VERSION ([0-9]+).*" "\\1" TBB_BINARY_VERSION "${_tbb_version_info}")
-set(TBB_BINARY_MINOR_VERSION ${_tbb_ver_minor})
+string(REGEX REPLACE "..(..)." "\\1" TBB_BINARY_MINOR_VERSION "${TBB_INTERFACE_VERSION}")
 set(TBBMALLOC_BINARY_VERSION 2)
 set(TBBBIND_BINARY_VERSION 3)
 
@@ -84,6 +98,11 @@ endif()
 
 set(CMAKE_CXX_EXTENSIONS OFF) # use -std=c++... instead of -std=gnu++...
 # ---------------------------------------------------------------------------------------------------------
+# Setup symbol visibility properties.
+
+set(CMAKE_VISIBILITY_INLINES_HIDDEN TRUE)
+set(CMAKE_CXX_VISIBILITY_PRESET "hidden")
+# ---------------------------------------------------------------------------------------------------------
 
 # Detect architecture (bitness).
 if (CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -101,14 +120,37 @@ option(TBB4PY_BUILD "Enable tbb4py build" OFF)
 option(TBB_BUILD "Enable tbb build" ON)
 option(TBBMALLOC_BUILD "Enable tbbmalloc build" ON)
 cmake_dependent_option(TBBMALLOC_PROXY_BUILD "Enable tbbmalloc_proxy build" ON "TBBMALLOC_BUILD" OFF)
-option(TBB_CPF "Enable preview features of the library" OFF)
 option(TBB_FIND_PACKAGE "Enable search for external oneTBB using find_package instead of build from sources" OFF)
 option(TBB_DISABLE_HWLOC_AUTOMATIC_SEARCH "Disable HWLOC automatic search by pkg-config tool" ${CMAKE_CROSSCOMPILING})
 option(TBB_ENABLE_IPO "Enable Interprocedural Optimization (IPO) during the compilation" ON)
+option(TBB_CONTROL_FLOW_GUARD "Enable Control Flow Guard (CFG) during the compilation" OFF)
 option(TBB_FUZZ_TESTING "Enable fuzz testing" OFF)
 option(TBB_INSTALL "Enable installation" ON)
+option(TBB_FILE_TRIM "Enable __FILE__ trim" ON)
+if(LINUX)
+option(TBB_LINUX_SEPARATE_DBG "Enable separation of the debug symbols during the build" OFF)
+endif()
 if(APPLE)
 option(TBB_BUILD_APPLE_FRAMEWORKS "Build as Apple Frameworks" OFF)
+endif()
+if (TCM_BUILD)
+  set(TCM_BUILD_OPTION_EXPLICITLY_SET TRUE)
+endif()
+option(TCM_BUILD "Enable Thread Composability Manager (TCM) build" ON)
+
+if (WIN32)
+    if (TBB_VERIFY_DEPENDENCY_SIGNATURE)
+        message(STATUS "Dependency signature verification during dynamic linking in run-time is ENABLED.")
+    elseif (NOT DEFINED TBB_VERIFY_DEPENDENCY_SIGNATURE)
+        message(WARNING
+            "Dependency signature verification during dynamic linking in run-time is disabled by "
+            "default. This may lead to security vulnerabilities. See installation section in "
+            "oneTBB documentation for more details.")
+    else()
+        message(STATUS "Dependency signature verification during dynamic linking in run-time is DISABLED")
+    endif()
+    option(TBB_VERIFY_DEPENDENCY_SIGNATURE
+        "Verify signature of a dependency during its dynamic linking at run-time on Windows*" OFF)
 endif()
 
 if (NOT DEFINED BUILD_SHARED_LIBS)
@@ -210,20 +252,18 @@ foreach(FILE_WITH_EXTRA_TARGETS ${FILES_WITH_EXTRA_TARGETS})
     include(${FILE_WITH_EXTRA_TARGETS})
 endforeach()
 
-# - Enabling LTO on Android causes the NDK bug.
-#   NDK throws the warning: "argument unused during compilation: '-Wa,--noexecstack'"
-# - For some reason GCC does not instrument code with Thread Sanitizer when lto is enabled and C linker is used.
-if (TBB_ENABLE_IPO AND BUILD_SHARED_LIBS AND NOT ANDROID_PLATFORM AND NOT TBB_SANITIZE MATCHES "thread")
-    if (NOT CMAKE_VERSION VERSION_LESS 3.9)
-        cmake_policy(SET CMP0069 NEW)
-        include(CheckIPOSupported)
-        check_ipo_supported(RESULT TBB_IPO_PROPERTY)
+if (TBB_FILE_TRIM)
+    file(RELATIVE_PATH TBB_RELATIVE_BIN_PATH ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR})
+    file(TO_NATIVE_PATH ${CMAKE_SOURCE_DIR} NATIVE_TBB_PROJECT_ROOT_DIR)
+    if (TBB_RELATIVE_BIN_PATH)
+        file(TO_NATIVE_PATH ${TBB_RELATIVE_BIN_PATH} NATIVE_TBB_RELATIVE_BIN_PATH)
     else()
-        set(TBB_IPO_FLAGS TRUE)
+        file(TO_NATIVE_PATH ${CMAKE_CURRENT_BINARY_DIR} NATIVE_TBB_RELATIVE_BIN_PATH)
     endif()
-    if (TBB_IPO_PROPERTY OR TBB_IPO_FLAGS)
-        message(STATUS "IPO enabled")
-    endif()
+endif ()
+
+if (TBB_CONTROL_FLOW_GUARD)
+    message(STATUS "Control Flow Guard (CFG) enabled")
 endif()
 
 set(TBB_COMPILER_SETTINGS_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/compilers/${CMAKE_CXX_COMPILER_ID}.cmake)
@@ -231,6 +271,27 @@ if (EXISTS ${TBB_COMPILER_SETTINGS_FILE})
     include(${TBB_COMPILER_SETTINGS_FILE})
 else()
     message(WARNING "TBB compiler settings not found ${TBB_COMPILER_SETTINGS_FILE}")
+endif()
+
+# - Enabling LTO on Android causes the NDK bug.
+#   NDK throws the warning: "argument unused during compilation: '-Wa,--noexecstack'"
+# - For some reason GCC does not instrument code with Thread Sanitizer when lto is enabled and C linker is used.
+if (TBB_ENABLE_IPO AND BUILD_SHARED_LIBS AND NOT ANDROID_PLATFORM AND NOT TBB_SANITIZE MATCHES "thread")
+    # For older cmake versions without CheckIPOSupported and when ipo detection is broken,
+    # try to enable IPO unconditionally.
+    if (CMAKE_VERSION VERSION_LESS 3.9 OR TBB_IPO_DETECTION_BROKEN)
+        set(TBB_IPO_FLAGS TRUE)
+    else()
+        cmake_policy(SET CMP0069 NEW)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT TBB_IPO_PROPERTY)
+        if (NOT TBB_IPO_PROPERTY)
+            message(WARNING "IPO disabled: not supported by this compiler.")
+        endif()
+    endif()
+    if (TBB_IPO_PROPERTY OR TBB_IPO_FLAGS)
+        message(STATUS "IPO enabled")
+    endif()
 endif()
 
 if (TBB_FIND_PACKAGE AND TBB_DIR)
@@ -288,13 +349,28 @@ else()
     endif()
 endif()
 
-if (TBB_TEST)
+if (TBB_TEST OR TCM_TEST)
     enable_testing()
+endif()
+
+if (TBB_TEST)
     add_subdirectory(test)
 endif()
 
 if (TBB_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+
+if (TBB_DOC_EXAMPLES)
+    set(TBB_DOC_EXAMPLES_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/doc/main/examples_testing")
+    if (NOT EXISTS ${TBB_DOC_EXAMPLES_DIRECTORY})
+        message(FATAL_ERROR "Documentation examples are not found while testing was enabled")
+    else()
+        message(STATUS "Enabling testing for examples from documentation")
+        enable_testing()
+        add_subdirectory(${TBB_DOC_EXAMPLES_DIRECTORY})
+    endif()
 endif()
 
 if (TBB_BENCH)
@@ -339,6 +415,17 @@ endif()
 
 if (TBB4PY_BUILD)
     add_subdirectory(python)
+endif()
+
+if (TCM_BUILD)
+  set(TCM_SUBDIR_NAME thread_composability_manager)
+  if (IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${TCM_SUBDIR_NAME}")
+    add_subdirectory(${TCM_SUBDIR_NAME})
+  elseif (TCM_BUILD_OPTION_EXPLICITLY_SET)
+    message(FATAL_ERROR "Build of Thread Composability Manager (TCM) is disabled since "
+                        "${TCM_SUBDIR_NAME} subdirectory does not exist")
+  endif()
+  unset(TCM_SUBDIR_NAME)
 endif()
 
 # Keep it the last instruction.

@@ -1,5 +1,6 @@
 /*
     Copyright (c) 2021-2024 Intel Corporation
+    Copyright (c) 2026 UXL Foundation Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -53,8 +54,8 @@ public:
     collaborative_call_stack_task(const F& f, wait_context& wctx) : m_func(f), m_wait_ctx(wctx) {}
 };
 
-constexpr std::uintptr_t collaborative_once_max_references = max_nfs_size;
-constexpr std::uintptr_t collaborative_once_references_mask = collaborative_once_max_references-1;
+__TBB_GLOBAL_VAR constexpr std::uintptr_t collaborative_once_max_references = max_nfs_size;
+__TBB_GLOBAL_VAR constexpr std::uintptr_t collaborative_once_references_mask = collaborative_once_max_references-1;
 
 class alignas(max_nfs_size) collaborative_once_runner : no_copy {
 
@@ -172,7 +173,7 @@ class collaborative_once_flag : no_copy {
             spin_wait_until_eq(m_state, expected);
         } while (!m_state.compare_exchange_strong(expected, desired));
     }
-    
+
     template <typename Fn>
     void do_collaborative_call_once(Fn&& f) {
         std::uintptr_t expected = m_state.load(std::memory_order_acquire);

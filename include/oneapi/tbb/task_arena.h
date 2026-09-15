@@ -1,5 +1,6 @@
 /*
-    Copyright (c) 2005-2023 Intel Corporation
+    Copyright (c) 2005-2025 Intel Corporation
+    Copyright (c) 2025 UXL Foundation Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
@@ -25,12 +26,13 @@
 #include "detail/_namespace_injection.h"
 #include "detail/_small_object_pool.h"
 #include "detail/_task.h"
-
 #include "detail/_task_handle.h"
-
-#if __TBB_ARENA_BINDING
+#include "detail/_parallel_phase.h"
+#include "detail/_utils.h"
 #include "info.h"
-#endif /*__TBB_ARENA_BINDING*/
+#include "task_group.h"
+
+#include <vector>
 
 namespace tbb {
 namespace detail {
@@ -95,6 +97,12 @@ TBB_EXPORT void __TBB_EXPORTED_FUNC isolate_within_arena(d1::delegate_base& d, s
 TBB_EXPORT void __TBB_EXPORTED_FUNC enqueue(d1::task&, d1::task_arena_base*);
 TBB_EXPORT void __TBB_EXPORTED_FUNC enqueue(d1::task&, d1::task_group_context&, d1::task_arena_base*);
 TBB_EXPORT void __TBB_EXPORTED_FUNC submit(d1::task&, d1::task_group_context&, arena*, std::uintptr_t);
+
+TBB_EXPORT void __TBB_EXPORTED_FUNC enter_parallel_phase(d1::task_arena_base*, std::uintptr_t);
+TBB_EXPORT void __TBB_EXPORTED_FUNC exit_parallel_phase(d1::task_arena_base*, std::uintptr_t);
+
+// Maintained for backwards compatibility
+TBB_EXPORT d1::slot_id __TBB_EXPORTED_FUNC execution_slot(const d1::task_arena_base&);
 } // namespace r1
 
 namespace d2 {
@@ -104,14 +112,20 @@ inline void enqueue_impl(task_handle&& th, d1::task_arena_base* ta) {
     auto& ctx = task_handle_accessor::ctx_of(th);
 
     // Do not access th after release
-    r1::enqueue(*task_handle_accessor::release(th), ctx, ta);
+    task_handle_task* task_ptr = task_handle_accessor::release(th);
+#if __TBB_PREVIEW_TASK_GROUP_EXTENSIONS
+    if (task_ptr->has_dependencies() && !task_ptr->release_dependency()) {
+        return;
+    }
+#endif
+    r1::enqueue(*task_ptr, ctx, ta);
 }
 } //namespace d2
 
 namespace d1 {
 
-static constexpr unsigned num_priority_levels = 3;
-static constexpr int priority_stride = INT_MAX / (num_priority_levels + 1);
+__TBB_GLOBAL_VAR constexpr unsigned num_priority_levels = 3;
+__TBB_GLOBAL_VAR constexpr int priority_stride = INT_MAX / (num_priority_levels + 1);
 
 class task_arena_base {
     friend struct r1::task_arena_impl;
@@ -122,9 +136,13 @@ public:
         normal = 2 * priority_stride,
         high   = 3 * priority_stride
     };
-#if __TBB_ARENA_BINDING
+
+    enum class leave_policy : int {
+        automatic = 0,
+        fast      = 1
+    };
+
     using constraints = tbb::detail::d1::constraints;
-#endif /*__TBB_ARENA_BINDING*/
 protected:
     //! Special settings
     intptr_t my_version_and_traits;
@@ -162,40 +180,62 @@ protected:
         return (my_version_and_traits & core_type_support_flag) == core_type_support_flag ? my_max_threads_per_core : automatic;
     }
 
+    leave_policy get_leave_policy() const {
+        return (my_version_and_traits & fast_leave_policy_flag) ? leave_policy::fast : leave_policy::automatic;
+    }
+
+    int leave_policy_trait(leave_policy lp) const {
+        return lp == leave_policy::fast ? fast_leave_policy_flag : 0;
+    }
+
+    void set_leave_policy(leave_policy lp) {
+        my_version_and_traits = (my_version_and_traits & ~intptr_t(fast_leave_policy_flag)) |
+                                leave_policy_trait(lp);
+    }
+
     enum {
-        default_flags = 0
-        , core_type_support_flag = 1
+        default_flags               = 0,
+        core_type_support_flag      = 1,
+        fast_leave_policy_flag      = 1 << 1
     };
 
-    task_arena_base(int max_concurrency, unsigned reserved_for_masters, priority a_priority)
-        : my_version_and_traits(default_flags | core_type_support_flag)
+    task_arena_base(int max_concurrency, unsigned reserved_slots, priority a_priority , leave_policy lp
+    )
+        : my_version_and_traits(default_flags | core_type_support_flag | leave_policy_trait(lp)
+        )
         , my_initialization_state(do_once_state::uninitialized)
         , my_arena(nullptr)
         , my_max_concurrency(max_concurrency)
-        , my_num_reserved_slots(reserved_for_masters)
+        , my_num_reserved_slots(reserved_slots)
         , my_priority(a_priority)
         , my_numa_id(automatic)
         , my_core_type(automatic)
         , my_max_threads_per_core(automatic)
         {}
 
-#if __TBB_ARENA_BINDING
-    task_arena_base(const constraints& constraints_, unsigned reserved_for_masters, priority a_priority)
-        : my_version_and_traits(default_flags | core_type_support_flag)
+    task_arena_base(const constraints& constraints_, unsigned reserved_slots, priority a_priority, leave_policy lp
+    )
+        : my_version_and_traits(default_flags | core_type_support_flag  | leave_policy_trait(lp)
+                )
         , my_initialization_state(do_once_state::uninitialized)
         , my_arena(nullptr)
         , my_max_concurrency(constraints_.max_concurrency)
-        , my_num_reserved_slots(reserved_for_masters)
+        , my_num_reserved_slots(reserved_slots)
         , my_priority(a_priority)
         , my_numa_id(constraints_.numa_id)
         , my_core_type(constraints_.core_type)
         , my_max_threads_per_core(constraints_.max_threads_per_core)
         {}
-#endif /*__TBB_ARENA_BINDING*/
+
 public:
     //! Typedef for number of threads that is automatic.
-    static const int automatic = -1;
-    static const int not_initialized = -2;
+    static constexpr int automatic = -1;
+    //! Typedef for current thread index in an uninitialized arena.
+    static constexpr int not_initialized = -2;
+#if __TBB_PREVIEW_TASK_ARENA_CORE_TYPE_SELECTOR
+    //! Typedef for core type(s) to be specified by the provided selector.
+    static constexpr int selectable = -2;
+#endif
 };
 
 template<typename R, typename F>
@@ -251,48 +291,81 @@ class task_arena : public task_arena_base {
         r1::execute(*this, func);
         return func.consume_result();
     }
+
+    d2::task_group_status wait_for_impl(d2::task_group& tg) {
+        d2::task_group_status status = d2::task_group_status::not_complete;
+        d2::wait_delegate wd{tg, status};
+        r1::execute(*this, wd);
+        __TBB_ASSERT(status != d2::task_group_status::not_complete,
+                "unexpected premature exit from wait_for: task group status is still not complete");
+        return status;
+    }
+#if __TBB_PREVIEW_TASK_GROUP_EXTENSIONS
+    d2::task_group_status wait_for_impl(d2::task_completion_handle& comp_handle) {
+        d2::task_group_status status = d2::task_group_status::not_complete;
+        d2::wait_completion_delegate wd{comp_handle, status};
+        r1::execute(*this, wd);
+        __TBB_ASSERT(status != d2::task_group_status::not_complete,
+                "unexpected premature exit from wait_for: task status is still not complete");
+        return status;
+    }
+#endif
+
 public:
     //! Creates task_arena with certain concurrency limits
     /** Sets up settings only, real construction is deferred till the first method invocation
      *  @arg max_concurrency specifies total number of slots in arena where threads work
-     *  @arg reserved_for_masters specifies number of slots to be used by external threads only.
+     *  @arg reserved_slots specifies number of slots to be used by external threads only.
      *       Value of 1 is default and reflects behavior of implicit arenas.
      **/
-    task_arena(int max_concurrency_ = automatic, unsigned reserved_for_masters = 1,
-               priority a_priority = priority::normal)
-        : task_arena_base(max_concurrency_, reserved_for_masters, a_priority)
+    task_arena(int max_concurrency_ = automatic, unsigned reserved_slots = 1,
+               priority a_priority = priority::normal, leave_policy lp = leave_policy::automatic
+    )
+        : task_arena_base(max_concurrency_, reserved_slots, a_priority , lp)
     {}
 
-#if __TBB_ARENA_BINDING
     //! Creates task arena pinned to certain NUMA node
-    task_arena(const constraints& constraints_, unsigned reserved_for_masters = 1,
-               priority a_priority = priority::normal)
-        : task_arena_base(constraints_, reserved_for_masters, a_priority)
+    task_arena(const constraints& constraints_, unsigned reserved_slots = 1,
+               priority a_priority = priority::normal, leave_policy lp = leave_policy::automatic
+    )
+        : task_arena_base(constraints_, reserved_slots, a_priority, lp)
     {}
 
-    //! Copies settings from another task_arena
-    task_arena(const task_arena &s) // copy settings but not the reference or instance
-        : task_arena_base(
-            constraints{}
-                .set_numa_id(s.my_numa_id)
-                .set_max_concurrency(s.my_max_concurrency)
-                .set_core_type(s.my_core_type)
-                .set_max_threads_per_core(s.my_max_threads_per_core)
-            , s.my_num_reserved_slots, s.my_priority)
-    {}
-#else
+#if __TBB_PREVIEW_TASK_ARENA_CORE_TYPE_SELECTOR
+    //! Creates task arena with a custom selector for core types
+    template <typename Selector,
+              typename = decltype(static_cast<int>(std::declval<Selector>()(std::declval<std::tuple<int, size_t, size_t>>())))>
+    task_arena(const constraints& constraints_, Selector selector_,
+               unsigned reserved_for_masters = 1, priority a_priority = priority::normal,
+               leave_policy lp = leave_policy::automatic
+    )
+        : task_arena_base(constraints_, reserved_for_masters, a_priority, lp)
+    {
+        if (my_core_type == selectable) {
+            my_core_type = apply_core_type_selector(selector_);
+        }
+    }
+#endif
+
     //! Copies settings from another task_arena
     task_arena(const task_arena& a) // copy settings but not the reference or instance
-        : task_arena_base(a.my_max_concurrency, a.my_num_reserved_slots, a.my_priority)
+        : task_arena_base(
+            constraints{}
+                .set_numa_id(a.my_numa_id)
+                .set_max_concurrency(a.my_max_concurrency)
+                .set_core_type(a.my_core_type)
+                .set_max_threads_per_core(a.my_max_threads_per_core)
+            , a.my_num_reserved_slots, a.my_priority, a.get_leave_policy()
+        )
+
     {}
-#endif /*__TBB_ARENA_BINDING*/
 
     //! Tag class used to indicate the "attaching" constructor
     struct attach {};
 
     //! Creates an instance of task_arena attached to the current arena of the thread
     explicit task_arena( attach )
-        : task_arena_base(automatic, 1, priority::normal) // use default settings if attach fails
+        : task_arena_base(automatic, 1, priority::normal, leave_policy::automatic ) // use default settings if attach fails
     {
         if (r1::attach(*this)) {
             mark_initialized();
@@ -310,22 +383,45 @@ public:
     }
 
     //! Overrides concurrency level and forces initialization of internal representation
-    void initialize(int max_concurrency_, unsigned reserved_for_masters = 1,
-                    priority a_priority = priority::normal)
+    void initialize(int max_concurrency_, unsigned reserved_slots = 1,
+                    priority a_priority = priority::normal, leave_policy lp = leave_policy::automatic)
     {
         __TBB_ASSERT(!my_arena.load(std::memory_order_relaxed), "Impossible to modify settings of an already initialized task_arena");
         if( !is_active() ) {
             my_max_concurrency = max_concurrency_;
-            my_num_reserved_slots = reserved_for_masters;
+            my_num_reserved_slots = reserved_slots;
             my_priority = a_priority;
+            set_leave_policy(lp);
             r1::initialize(*this);
             mark_initialized();
         }
     }
 
-#if __TBB_ARENA_BINDING
-    void initialize(constraints constraints_, unsigned reserved_for_masters = 1,
-                    priority a_priority = priority::normal)
+    //! Overrides constraints and forces initialization of internal representation
+    void initialize(constraints constraints_, unsigned reserved_slots = 1,
+                    priority a_priority = priority::normal, leave_policy lp = leave_policy::automatic)
+    {
+        __TBB_ASSERT(!my_arena.load(std::memory_order_relaxed), "Impossible to modify settings of an already initialized task_arena");
+        if( !is_active() ) {
+            my_numa_id = constraints_.numa_id;
+            my_max_concurrency = constraints_.max_concurrency;
+            my_core_type = constraints_.core_type;
+            my_max_threads_per_core = constraints_.max_threads_per_core;
+            my_num_reserved_slots = reserved_slots;
+            my_priority = a_priority;
+            set_leave_policy(lp);
+            r1::initialize(*this);
+            mark_initialized();
+        }
+    }
+
+#if __TBB_PREVIEW_TASK_ARENA_CORE_TYPE_SELECTOR
+    //! Overrides constraints with a custom selector for core types and forces initialization of internal representation
+    template<typename Selector,
+             typename = decltype(static_cast<int>(std::declval<Selector>()(std::declval<std::tuple<int, size_t, size_t>>())))>
+    void initialize(constraints constraints_, Selector selector_,
+                    unsigned reserved_for_masters = 1, priority a_priority = priority::normal, leave_policy lp = leave_policy::automatic
+    )
     {
         __TBB_ASSERT(!my_arena.load(std::memory_order_relaxed), "Impossible to modify settings of an already initialized task_arena");
         if( !is_active() ) {
@@ -335,11 +431,15 @@ public:
             my_max_threads_per_core = constraints_.max_threads_per_core;
             my_num_reserved_slots = reserved_for_masters;
             my_priority = a_priority;
+            set_leave_policy(lp);
+            if (my_core_type == selectable) {
+                my_core_type = apply_core_type_selector(selector_);
+            }
             r1::initialize(*this);
             mark_initialized();
         }
     }
-#endif /*__TBB_ARENA_BINDING*/
+#endif /*__TBB_PREVIEW_TASK_ARENA_CORE_TYPE_SELECTOR*/
 
     //! Attaches this instance to the current arena of the thread
     void initialize(attach) {
@@ -395,6 +495,29 @@ public:
         d2::enqueue_impl(std::move(th), this);
     }
 
+    //! Adds a task to process a functor into the task_group and then enqueues it into the arena,
+    //! and immediately returns.
+    //! Does not require the calling thread to join the arena.
+    template<typename F>
+    void enqueue(F&& f, d2::task_group& tg) {
+        initialize();
+        d2::enqueue_impl(tg.defer(std::forward<F>(f)), this);
+    }
+
+    //! Waits for all tasks in the task group to complete or be canceled.
+    //! During the wait, may execute tasks in the task_arena.
+    d2::task_group_status wait_for(d2::task_group& tg) {
+        initialize();
+        return wait_for_impl(tg);
+    }
+
+#if __TBB_PREVIEW_TASK_GROUP_EXTENSIONS
+    d2::task_group_status wait_for(d2::task_completion_handle& comp_handle) {
+        initialize();
+        return wait_for_impl(comp_handle);
+    }
+#endif
+
     //! Joins the arena and executes a mutable functor, then returns
     //! If not possible to join, wraps the functor into a task, enqueues it and waits for task completion
     //! Can decrement the arena demand for workers, causing a worker to leave and free a slot to the calling thread
@@ -402,6 +525,73 @@ public:
     template<typename F>
     auto execute(F&& f) -> decltype(f()) {
         return execute_impl<decltype(f())>(f);
+    }
+
+    class parallel_phase : no_copy {
+    public:
+        class flags {
+            friend class parallel_phase;
+            friend class task_arena;
+            friend void start_parallel_phase(flags);
+            friend void end_parallel_phase(flags);
+
+            std::uint32_t my_start_flags;
+            std::uint32_t my_end_flags;
+        public:
+            flags() : my_start_flags(0), my_end_flags(0) {}
+            template <typename... Flags, typename = typename std::enable_if<phase::valid_flags<Flags...>::value>::type>
+            flags(Flags...) : my_start_flags(phase::combine_tags<phase::start, Flags...>::value),
+                  my_end_flags(phase::combine_tags<phase::end, Flags...>::value) {}
+        };
+        class end_flag_fast_leave : public phase::tag<phase::end, phase::end_fast_leave> {};
+
+        parallel_phase(d1::attach, flags f = {}) : my_flags(f) {
+            r1::enter_parallel_phase(nullptr, /*reserved*/0);
+        }
+        parallel_phase(task_arena& ta, flags f = {})
+            : my_arena(&ta), my_flags(f)
+        {
+            suppress_unused_warning(my_reserved);
+            my_arena->start_parallel_phase(my_flags);
+        }
+        parallel_phase(parallel_phase&& other)
+            : my_arena(other.my_arena), my_flags(other.my_flags), my_active(other.my_active) {
+            other.my_active = false;
+        }
+        parallel_phase& operator=(parallel_phase&& other) {
+            if (my_active)
+                r1::exit_parallel_phase(my_arena, static_cast<std::uintptr_t>(my_flags.my_end_flags));
+            my_arena = other.my_arena;
+            my_flags = other.my_flags;
+            my_active = other.my_active;
+            other.my_active = false;
+            return *this;
+        }
+        ~parallel_phase() {
+            if (my_active)
+                r1::exit_parallel_phase(my_arena, static_cast<std::uintptr_t>(my_flags.my_end_flags));
+        }
+
+        void end() {
+            if (my_active) {
+                my_active = false;
+                r1::exit_parallel_phase(my_arena, static_cast<std::uintptr_t>(my_flags.my_end_flags));
+            }
+        }
+    private:
+        task_arena* my_arena{nullptr};
+        flags my_flags;
+        bool my_active{true};
+        std::uintptr_t my_reserved{};
+    };
+
+    void start_parallel_phase(parallel_phase::flags f = {}) {
+        initialize();
+        r1::enter_parallel_phase(this, static_cast<std::uintptr_t>(f.my_start_flags));
+    }
+    void end_parallel_phase(parallel_phase::flags f = {}) {
+        __TBB_ASSERT(my_initialization_state.load(std::memory_order_relaxed) == do_once_state::initialized, nullptr);
+        r1::exit_parallel_phase(this, static_cast<std::uintptr_t>(f.my_end_flags));
     }
 
 #if __TBB_EXTRA_DEBUG
@@ -415,6 +605,25 @@ public:
     int debug_max_concurrency() const {
         // Handle special cases inside the library
         return my_max_concurrency;
+    }
+
+    //! Returns my_priority
+    priority debug_priority() const {
+        return my_priority;
+    }
+
+    //! Returns leave policy
+    leave_policy debug_leave_policy() const {
+        return get_leave_policy();
+    }
+
+    //! Returns constraints
+    constraints debug_constraints() const {
+        return constraints{}
+            .set_numa_id(my_numa_id)
+            .set_max_concurrency(my_max_concurrency)
+            .set_core_type(my_core_type)
+            .set_max_threads_per_core(my_max_threads_per_core);
     }
 
     //! Wait for all work in the arena to be completed
@@ -472,6 +681,31 @@ inline void enqueue(F&& f) {
     enqueue_impl(std::forward<F>(f), nullptr);
 }
 
+template<typename F>
+inline void enqueue(F&& f, d2::task_group& tg) {
+    d2::enqueue_impl(tg.defer(std::forward<F>(f)), nullptr);
+}
+
+inline void start_parallel_phase(task_arena::parallel_phase::flags f = {}) {
+    r1::enter_parallel_phase(nullptr, static_cast<std::uintptr_t>(f.my_start_flags));
+}
+
+inline void end_parallel_phase(task_arena::parallel_phase::flags f = {}) {
+    r1::exit_parallel_phase(nullptr, static_cast<std::uintptr_t>(f.my_end_flags));
+}
+
+inline std::vector<d1::task_arena> create_numa_task_arenas(d1::constraints c = {},
+                                                           unsigned reserved_slots = 0)
+{
+    static std::vector<numa_node_id> node_indices = d1::numa_nodes();
+    std::vector<d1::task_arena> numa_arenas;
+    numa_arenas.reserve(node_indices.size());
+    for (auto numa_id : node_indices) {
+        numa_arenas.emplace_back(c.set_numa_id(numa_id), reserved_slots);
+    }
+    return numa_arenas;
+}
+
 using r1::submit;
 
 } // namespace d1
@@ -480,6 +714,7 @@ using r1::submit;
 inline namespace v1 {
 using detail::d1::task_arena;
 using detail::d1::attach;
+using detail::d1::create_numa_task_arenas;
 
 #if __TBB_PREVIEW_TASK_GROUP_EXTENSIONS
 using detail::d1::is_inside_task;
@@ -491,6 +726,9 @@ using detail::d1::max_concurrency;
 using detail::d1::isolate;
 
 using detail::d1::enqueue;
+
+using detail::d1::start_parallel_phase;
+using detail::d1::end_parallel_phase;
 } // namespace this_task_arena
 
 } // inline namespace v1

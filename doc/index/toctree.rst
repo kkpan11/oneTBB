@@ -2,6 +2,7 @@
 
 .. toctree::
    :caption: About
+   :hidden:
    :maxdepth: 1
 
    /main/intro/help_support
@@ -10,14 +11,16 @@
    /main/intro/Benefits
    /main/intro/testing_approach
    /main/intro/limitations.rst
+   /main/intro/static_linking
+   /main/intro/api_abi_changes
 
 
 .. toctree::
    :caption: Get Started
-   :maxdepth: 2
+   :hidden:
+   :maxdepth: 1
 
    /GSG/get_started
-   /GSG/intro
    /GSG/system_requirements
    /GSG/installation
    /GSG/next_steps 
@@ -27,6 +30,7 @@
 
 .. toctree::
    :maxdepth: 3
+   :hidden:
    :caption: Developer Guide
 
    /main/tbb_userguide/title
@@ -34,6 +38,15 @@
 
 .. toctree::
    :maxdepth: 3
+   :hidden:
    :caption: Developer Reference
 
    /main/reference/reference
+
+
+.. toctree::
+   :maxdepth: 3
+   :hidden:
+   :caption: Specification
+
+   /main/specification/source/index
